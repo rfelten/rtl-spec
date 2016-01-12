@@ -38,7 +38,6 @@
 #include "../include/ITE.h"
 #include "../include/QUE.h"
 #include "../include/FFT.h"
-#include "../include/TCP.h"
 #include "../include/uthash.h"
 
 #define DEFAULT_LOG2_FFT_SIZE 8
@@ -54,9 +53,7 @@
 #define DEFAULT_SOVERLAP (1<<DEFAULT_LOG2_FFT_SIZE)/2
 #define DEFAULT_WINDOW_FUN_STR "hanning"
 #define DEFAULT_FFT_BATCHLEN 10
-#define DEFAULT_CMPR_LEVEL 6
 #define DEFAULT_SAMP_RATE 2400000
-#define DEFAULT_TCP_HOSTS "127.0.0.1:5000"
 
 #define SEQUENTIAL_HOPPING_STRATEGY     0
 #define RANDOM_HOPPING_STRATEGY         1
@@ -72,8 +69,7 @@
 #define THR_SAMP_WIND  3
 #define THR_FFT        4
 #define THR_AVG        5
-#define THR_CMPR       6
-#define THR_TCP_TRNS   7
+#define THR_DUMP       8
 
 #define FLAG_FREQ_CORR 1
 #define FLAG_SPEC_MONI 2
@@ -100,14 +96,12 @@ typedef struct {
   unsigned int monitor_time;
   unsigned int min_time_res;
   unsigned int fft_batchlen;
-  unsigned int cmpr_level;
   int          dev_index;
   int          clk_off;
   float        gain;
   float        freq_overlap;
   char         *hopping_strategy_str;
   char         *window_fun_str;
-  char         *tcp_hosts;
 } ManagerCTX;
 
 typedef struct {
@@ -132,14 +126,12 @@ typedef struct {
   unsigned int monitor_time;
   unsigned int min_time_res;
   unsigned int fft_batchlen;
-  unsigned int cmpr_level;
   int          hopping_strategy_id;
   int          window_fun_id;
   int          dev_index;
   int          clk_off;
   float        gain;
   float        freq_overlap;
-  char         *tcp_hosts;
 } SpectrumMonitoringCTX;
 
 typedef struct {
@@ -155,7 +147,6 @@ typedef struct {
   unsigned int     *log2_fft_sizes;
   unsigned int     *avg_factors;
   unsigned int     *soverlaps;
-  unsigned int     *cmpr_levels;
   unsigned int     *center_freqs;
   int              hopping_strategy_id;
   int              window_fun_id;
@@ -197,34 +188,16 @@ typedef struct {
   size_t                qsout_cnt;
 } AveragingARG;
 
-typedef struct {
-  Thread *thread;
-  void   (*callback)(Item *);
-} CompressionCTX;
-
-typedef struct {
-  SpectrumMonitoringCTX *spec_moni_ctx;
-  CompressionCTX        *cmpr_ctx;
-  Queue                 *qin, **qsout;
-  size_t                qsout_cnt;
-} CompressionARG;
 
 typedef struct {
   Thread       *thread;
-  void         (*callback)(Item *);
-  size_t       tcp_hosts_cnt;
-  char         *tcp_host_lst;
-  char         **tcp_hosts;
-  uint32_t     *tcp_ports;
-  int          *tcp_bandwidths;
-} TcpTransmissionCTX;
+} DumpingCTX;
 
 typedef struct {
-  SpectrumMonitoringCTX *spec_moni_ctx;
-  TcpTransmissionCTX    *tcp_trns_ctx;
-  Queue                 *qin, **qsout;
-  size_t                qsout_cnt;
-} TcpTransmissionARG;
+  DumpingCTX   *dump_ctx;
+  Queue        *qin, **qsout;
+  int          qsout_cnt;
+} DumpingARG;
 
 /*! RTL-SDR Device Handle
  * 
@@ -264,13 +237,9 @@ static void* fft(void *args);
  */
 static void* averaging(void *args);
 
-/*! Signal Processing - Compression
+/*! Signal Processing - Dump data to stdout
  */
-static void* compression(void *args);
-
-/*! Signal Processing - TCP Transmission
- */
-static void* tcp_transmission(void *args);
+static void* dumping(void *args);
 
 int main(int argc, char *argv[]) {
 
@@ -326,11 +295,13 @@ int main(int argc, char *argv[]) {
     THR_release(spec_moni_ctx->thread);
     THR_release(freq_corr_ctx->thread);
     THR_release(manager_ctx->thread);
+    //FIXME free dump thread?
     
     // Free sensor contexts
     free(spec_moni_ctx);
     free(freq_corr_ctx);
     free(manager_ctx);
+    //FIXME free dump ctx?
     
 #if defined(VERBOSE)
     fprintf(stderr, "[SMAN] Terminated.\n");
@@ -343,7 +314,7 @@ int main(int argc, char *argv[]) {
   // Parse arguments and options
   void parse_args(int argc, char *argv[]) {
     int opt;
-    const char *options = "hd:c:k:g:y:s:f:b:a:o:q:t:r:w:l:m:";
+    const char *options = "hd:c:k:g:y:s:f:b:a:o:q:t:r:w:";
     
     // Option arguments
     while((opt = getopt(argc, argv, options)) != -1) {
@@ -395,13 +366,6 @@ int main(int argc, char *argv[]) {
 	case 'w':
 	  manager_ctx->window_fun_str = optarg;
 	  break;
-	case 'l':
-	  manager_ctx->cmpr_level = atol(optarg);
-	  if(manager_ctx->cmpr_level > 9) manager_ctx->cmpr_level = DEFAULT_CMPR_LEVEL;
-	  break;
-	case 'm':
-	  manager_ctx->tcp_hosts = optarg;
-	  break;
 	default:
 	  goto usage;
       }
@@ -423,8 +387,6 @@ int main(int argc, char *argv[]) {
 	"  [-a <avg_factor>] [-o <soverlap>] [-q <freq_overlap>]\n"
 	"  [-t <monitor_time>] [-r <min_time_res>]\n"
 	"  [-w <window>]\n"
-	"  [-l <cmpr_level>]\n"
-	"  [-m <hostname1>:<portnumber1>[;<bandwidth1>],...,<hostnameN>:<portnumberN>[;bandwidthN]]\n"
 	"\n"
 	"Arguments:\n"
 	"  min_freq               Lower frequency bound in Hz\n"
@@ -466,12 +428,6 @@ int main(int argc, char *argv[]) {
 	"                           rectangular\n"
 	"                           hanning\n"
 	"                           blackman_harris_4\n"
-	"  -l <cmpr_level>        Compression level [default=%u]\n"
-	"                           0 for no compression, fastest\n"
-	"                           9 for highest compression, slowest\n"
-	"  -m <hostname1>:<portnumber1>[;<bandwidth1>],...,<hostnameN>:<portnumberN>[;<bandwidthN>]\n"
-	"                         TCP collector hosts [default=%s]\n"
-	"                           Bandwidth limitation in Kb/s\n"
 	"",
 	argv[0],
 	manager_ctx->dev_index,
@@ -486,9 +442,8 @@ int main(int argc, char *argv[]) {
 	manager_ctx->freq_overlap,
 	manager_ctx->monitor_time,
 	manager_ctx->min_time_res,
-	manager_ctx->window_fun_str,
-	manager_ctx->cmpr_level,
-	manager_ctx->tcp_hosts);
+	manager_ctx->window_fun_str
+	);
       exit(1);
     } else {
       manager_ctx->min_freq = atol(argv[optind]);
@@ -509,12 +464,10 @@ int main(int argc, char *argv[]) {
   manager_ctx->monitor_time = DEFAULT_MONITOR_TIME;
   manager_ctx->min_time_res = DEFAULT_MIN_TIME_RES;
   manager_ctx->fft_batchlen = DEFAULT_FFT_BATCHLEN;
-  manager_ctx->cmpr_level = DEFAULT_CMPR_LEVEL;
   manager_ctx->gain = DEFAULT_GAIN;
   manager_ctx->freq_overlap = DEFAULT_FREQ_OVERLAP;
   manager_ctx->hopping_strategy_str = DEFAULT_HOPPING_STRATEGY_STR;
   manager_ctx->window_fun_str = DEFAULT_WINDOW_FUN_STR;
-  manager_ctx->tcp_hosts = DEFAULT_TCP_HOSTS;
   THR_initialize(&(manager_ctx->thread), THR_MANAGER);
   
   // Parse arguments/options and update context
@@ -537,7 +490,6 @@ int main(int argc, char *argv[]) {
   spec_moni_ctx->monitor_time = manager_ctx->monitor_time;
   spec_moni_ctx->min_time_res = manager_ctx->min_time_res;
   spec_moni_ctx->fft_batchlen = manager_ctx->fft_batchlen;
-  spec_moni_ctx->cmpr_level = manager_ctx->cmpr_level;
   spec_moni_ctx->gain = manager_ctx->gain;
   spec_moni_ctx->freq_overlap = manager_ctx->freq_overlap;
   if(strcmp(manager_ctx->hopping_strategy_str, "random") == 0)
@@ -552,7 +504,6 @@ int main(int argc, char *argv[]) {
     spec_moni_ctx->window_fun_id = BLACKMAN_HARRIS_WINDOW;
   else
     spec_moni_ctx->window_fun_id = SEQUENTIAL_HOPPING_STRATEGY;
-  spec_moni_ctx->tcp_hosts = manager_ctx->tcp_hosts;
   THR_initialize(&(spec_moni_ctx->thread), THR_SPEC_MONI);
   
   // Initialize RTL-SDR device and associated lock to guarantee mutual exclusive access 
@@ -831,7 +782,6 @@ static void* spectrum_monitoring(void *args) {
     unsigned int samp_rate;
     unsigned int log2_fft_size, avg_factor, soverlap;
     unsigned int monitor_time, min_time_res, fft_batchlen;
-    unsigned int cmpr_level;
 
     int clk_off;
     float gain, freq_overlap;
@@ -844,7 +794,6 @@ static void* spectrum_monitoring(void *args) {
     unsigned int *log2_fft_sizes = NULL;
     unsigned int *avg_factors = NULL;
     unsigned int *soverlaps = NULL;
-    unsigned int *cmpr_levels = NULL;
     unsigned int *center_freqs = NULL, *full_center_freqs = NULL;
     float *freq_overlaps = NULL;
     window_fun_ptr_t *window_funs = NULL;
@@ -853,66 +802,6 @@ static void* spectrum_monitoring(void *args) {
     long long cnt_total = 0, cnt_skipped = 0;
 #endif
 
-    int      i;
-    char     *host_id = NULL, **host_ids = NULL;
-    
-    int      tcp_hosts_cnt = 0;
-    char     tcp_host_lst[STR_LEN_LONG];
-    char     **tcp_hosts = NULL;
-    uint32_t *tcp_ports = NULL;
-    int      *tcp_bandwidths = NULL;
-
-    
-    // Parse TCP hosts
-    void parse_tcp_hosts() {
-      if(spec_moni_ctx->tcp_hosts != NULL && strcmp(spec_moni_ctx->tcp_hosts, "0") != 0) {
-	strncpy(tcp_host_lst, spec_moni_ctx->tcp_hosts, STR_LEN_LONG);
-	
-	// Count TCP hosts
-	tcp_hosts_cnt = 1;
-	for(i=0; tcp_host_lst[i] != '\0'; ++i) {
-	  if(tcp_host_lst[i] == ',') tcp_hosts_cnt++;
-	}
-	
-	// Allocate data structures
-	host_ids = (char **) realloc(host_ids, tcp_hosts_cnt * sizeof(char *));
-	tcp_hosts = (char **) malloc(tcp_hosts_cnt * sizeof(char *));
-	tcp_ports = (uint32_t *) malloc(tcp_hosts_cnt * sizeof(uint32_t));
-	tcp_bandwidths = (int *) malloc(tcp_hosts_cnt * sizeof(int));
-	
-	// Parsing
-	i = 0;
-	host_id = strtok(tcp_host_lst, ",");
-	while(host_id != NULL) {
-	  host_ids[i++] = host_id;
-	  host_id = strtok(NULL, ",");
-	}
-	assert(i == tcp_hosts_cnt);
-	
-	for(i=0; i<tcp_hosts_cnt; ++i) {
-	  char *hp, *host, *port, *bandwidth;
-	  hp = strtok(host_ids[i], ";");
-	  bandwidth = strtok(NULL, ";");
-	  if(bandwidth != NULL)
-	    tcp_bandwidths[i] = atoi(bandwidth);
-	  else
-	    tcp_bandwidths[i] = 0;
-	  
-	  host = strtok(hp, ":");
-	  if(host == NULL) {
-	    fprintf(stderr, "[FMON] ERROR: Invalid TCP host.\n");
-	    exit(1);
-	  }
-	  tcp_hosts[i] = host;
-	  port = strtok(NULL, ":");
-	  if(port == NULL) {
-	    fprintf(stderr, "[FMON] ERROR: Invalid TCP port.\n");
-	    exit(1);
-	  }
-	  tcp_ports[i] = atol(port);
-	}
-      }
-    }
     
     // History hash table
     pthread_mutex_t *hist_htable_mut;
@@ -931,15 +820,11 @@ static void* spectrum_monitoring(void *args) {
     AveragingCTX         *avg_ctx = NULL;
     AveragingARG         *avg_arg = NULL;
     
-    Queue                *q_cmpr = NULL;
-    CompressionCTX       *cmpr_ctx = NULL;
-    CompressionARG       *cmpr_arg = NULL;
-    
-    Queue                *q_tcp_trns = NULL;
-    TcpTransmissionCTX   *tcp_trns_ctx = NULL;
-    TcpTransmissionARG   *tcp_trns_arg = NULL;
-    
-    
+    Queue                *q_dump = NULL;
+    DumpingCTX           *dump_ctx;
+    DumpingARG           *dump_arg;
+
+
     /*! Rectangular Window
     */
     float rectangular_window(int n, int N) {
@@ -980,9 +865,7 @@ static void* spectrum_monitoring(void *args) {
 	if(samp_wind_ctx != NULL) samp_wind_ctx->callback = NULL;
 	if(fft_ctx != NULL) fft_ctx->callback = NULL;
 	if(avg_ctx != NULL) avg_ctx->callback = NULL;
-	if(cmpr_ctx != NULL) cmpr_ctx->callback = NULL;
-	if(tcp_trns_ctx != NULL) tcp_trns_ctx->callback = NULL;
-	
+
 	freq_step = (1 - freq_overlap) * samp_rate;
 	length = (max_freq - min_freq + 1e6) / freq_step;
 	
@@ -1001,11 +884,7 @@ static void* spectrum_monitoring(void *args) {
 	// Segment overlaps
 	soverlaps = (unsigned int *) malloc(length*sizeof(unsigned int));
 	for(i=0; i<length; ++i) soverlaps[i] = soverlap;
-	
-	// Compression levels
-	cmpr_levels = (unsigned int *) malloc(length*sizeof(unsigned int));
-	for(i=0; i<length; ++i) cmpr_levels[i] = cmpr_level;
-	
+
 	// Center frequencies
 	center_freqs = (unsigned int *) malloc(length*sizeof(unsigned int));
 	center_freqs[0] = min_freq + 0.5 * freq_step;
@@ -1047,9 +926,7 @@ static void* spectrum_monitoring(void *args) {
 	if(samp_wind_ctx != NULL) samp_wind_ctx->callback = NULL;
 	if(fft_ctx != NULL) fft_ctx->callback = NULL;
 	if(avg_ctx != NULL) avg_ctx->callback = NULL;
-	if(cmpr_ctx != NULL) cmpr_ctx->callback = NULL;
-	if(tcp_trns_ctx != NULL) tcp_trns_ctx->callback = NULL;
-	
+
 	// Initialize random number generator
 	srand((unsigned int) time(NULL));
 	
@@ -1071,11 +948,7 @@ static void* spectrum_monitoring(void *args) {
 	// Segment overlaps
 	soverlaps = (unsigned int *) malloc(length*sizeof(unsigned int));
 	for(i=0; i<length; ++i) soverlaps[i] = soverlap;
-	
-	// Compression levels
-	cmpr_levels = (unsigned int *) malloc(length*sizeof(unsigned int));
-	for(i=0; i<length; ++i) cmpr_levels[i] = cmpr_level;
-	
+
 	// Center frequencies
 	center_freqs = (unsigned int *) malloc(length*sizeof(unsigned int));
 	
@@ -1268,9 +1141,7 @@ static void* spectrum_monitoring(void *args) {
 	if(samp_wind_ctx != NULL) samp_wind_ctx->callback = NULL;
 	if(fft_ctx != NULL) fft_ctx->callback = similarity_fft_callback;
 	if(avg_ctx != NULL) avg_ctx->callback = NULL;
-	if(cmpr_ctx != NULL) cmpr_ctx->callback = NULL;
-	if(tcp_trns_ctx != NULL) tcp_trns_ctx->callback = NULL;
-	
+
 	// Initialize random number generator
 	srand((unsigned int) time(NULL));
 	
@@ -1292,10 +1163,6 @@ static void* spectrum_monitoring(void *args) {
 	// Segment overlaps
 	soverlaps = (unsigned int *) malloc(full_length*sizeof(unsigned int));
 	for(i=0; i<full_length; ++i) soverlaps[i] = soverlap;
-	
-	// Compression levels
-	cmpr_levels = (unsigned int *) malloc(full_length*sizeof(unsigned int));
-	for(i=0; i<full_length; ++i) cmpr_levels[i] = cmpr_level;
 	
 	// Center frequencies
 	full_center_freqs = (unsigned int *) malloc(full_length*sizeof(unsigned int));
@@ -1367,7 +1234,6 @@ static void* spectrum_monitoring(void *args) {
     monitor_time = spec_moni_ctx->monitor_time;
     min_time_res = spec_moni_ctx->min_time_res;
     fft_batchlen = spec_moni_ctx->fft_batchlen;
-    cmpr_level = spec_moni_ctx->cmpr_level;
     gain = spec_moni_ctx->gain;
     freq_overlap = spec_moni_ctx->freq_overlap;
     if(spec_moni_ctx->hopping_strategy_id == RANDOM_HOPPING_STRATEGY)
@@ -1384,23 +1250,11 @@ static void* spectrum_monitoring(void *args) {
     pthread_mutex_init(hist_htable_mut, NULL);
     similarity_hist_htable = NULL;
     
-    // Parse TCP hosts
-    parse_tcp_hosts();
-    
-    free(host_ids);
-    
-    // Require at least one transmission host
-    if(tcp_hosts_cnt <= 0) {
-      fprintf(stderr, "[FMON] ERROR: No host to transmit recorded data to.\n");
-      exit(1);
-    }
-    
     // Initialize signal processing queues
     q_size = MIN(10*fft_batchlen, 100);
     q_fft = QUE_initialize(q_size);
     q_avg = QUE_initialize(q_size);
-    q_cmpr = QUE_initialize(q_size);
-    q_tcp_trns = QUE_initialize(q_size);
+    q_dump = QUE_initialize(q_size);
     
     // Initialize signal processing contexts
     samp_wind_ctx = (SamplingWindowingCTX *) malloc(sizeof(SamplingWindowingCTX));
@@ -1415,17 +1269,9 @@ static void* spectrum_monitoring(void *args) {
     
     avg_ctx = (AveragingCTX *) malloc(sizeof(AveragingCTX));
     THR_initialize(&(avg_ctx->thread), THR_AVG);
-    
-    cmpr_ctx = (CompressionCTX *) malloc(sizeof(CompressionCTX));
-    THR_initialize(&(cmpr_ctx->thread), THR_CMPR);
-    
-    tcp_trns_ctx = (TcpTransmissionCTX *) malloc(sizeof(TcpTransmissionCTX));
-    tcp_trns_ctx->tcp_hosts_cnt = tcp_hosts_cnt;
-    tcp_trns_ctx->tcp_host_lst = spec_moni_ctx->tcp_hosts;
-    tcp_trns_ctx->tcp_hosts = tcp_hosts;
-    tcp_trns_ctx->tcp_ports = tcp_ports;
-    tcp_trns_ctx->tcp_bandwidths = tcp_bandwidths;
-    THR_initialize(&(tcp_trns_ctx->thread), THR_TCP_TRNS);
+
+    dump_ctx = (DumpingCTX *) malloc(sizeof(DumpingCTX));
+    THR_initialize(&(dump_ctx->thread), THR_DUMP);
     
     // Initialize signal processing arguments
     samp_wind_arg = (SamplingWindowingARG *) malloc(sizeof(SamplingWindowingARG));
@@ -1450,28 +1296,16 @@ static void* spectrum_monitoring(void *args) {
     avg_arg->qin = q_avg;
     avg_arg->qsout_cnt = 1;
     avg_arg->qsout = (Queue **) malloc(avg_arg->qsout_cnt*sizeof(Queue *));
-    avg_arg->qsout[0] = q_cmpr;
+    avg_arg->qsout[0] = q_dump;
 
-    cmpr_arg = (CompressionARG *) malloc(sizeof(CompressionARG));
-    cmpr_arg->spec_moni_ctx = spec_moni_ctx;
-    cmpr_arg->cmpr_ctx = cmpr_ctx;
-    cmpr_arg->qin = q_cmpr;
-    cmpr_arg->qsout_cnt = 1;
-    cmpr_arg->qsout = (Queue **) malloc(cmpr_arg->qsout_cnt*sizeof(Queue *));
-    cmpr_arg->qsout[0] = q_tcp_trns;
-    
-    tcp_trns_arg = (TcpTransmissionARG *) malloc(sizeof(TcpTransmissionARG));
-    tcp_trns_arg->spec_moni_ctx = spec_moni_ctx;
-    tcp_trns_arg->tcp_trns_ctx = tcp_trns_ctx;
-    tcp_trns_arg->qin = q_tcp_trns;
-    tcp_trns_arg->qsout_cnt = 0;
-    tcp_trns_arg->qsout = (Queue **) malloc(tcp_trns_arg->qsout_cnt*sizeof(Queue *));
+    dump_arg = (DumpingARG *) malloc(sizeof(DumpingARG));
+    dump_arg->qin = q_dump;
+    dump_arg->qsout_cnt = 0;
+    dump_arg->qsout = (Queue **) malloc(dump_arg->qsout_cnt*sizeof(Queue *));
 
-    
     // Start signal processing threads
     pthread_mutex_lock(samp_wind_ctx->thread->lock);
-    pthread_create(tcp_trns_ctx->thread->fd, NULL, tcp_transmission, tcp_trns_arg);
-    pthread_create(cmpr_ctx->thread->fd, NULL, compression, cmpr_arg);
+    pthread_create(dump_ctx->thread->fd, NULL, dumping, dump_arg);
     pthread_create(avg_ctx->thread->fd, NULL, averaging, avg_arg);
     pthread_create(fft_ctx->thread->fd, NULL, fft, fft_arg);
     pthread_create(samp_wind_ctx->thread->fd, NULL, sampling_windowing, samp_wind_arg);
@@ -1523,7 +1357,6 @@ static void* spectrum_monitoring(void *args) {
 	  samp_wind_ctx->log2_fft_sizes = log2_fft_sizes;
 	  samp_wind_ctx->avg_factors = avg_factors;
 	  samp_wind_ctx->soverlaps = soverlaps;
-	  samp_wind_ctx->cmpr_levels = cmpr_levels;
 	  samp_wind_ctx->center_freqs = center_freqs;
 	  samp_wind_ctx->freq_overlaps = freq_overlaps;
 	  samp_wind_ctx->window_funs = window_funs;
@@ -1573,28 +1406,20 @@ EXIT_SPECTRUM_MONITORING:
     pthread_join(*(samp_wind_ctx->thread->fd), NULL);
     pthread_join(*(fft_ctx->thread->fd), NULL);
     pthread_join(*(avg_ctx->thread->fd), NULL);
-    pthread_join(*(cmpr_ctx->thread->fd), NULL);
-    pthread_join(*(tcp_trns_ctx->thread->fd), NULL);
+    pthread_join(*(dump_ctx->thread->fd), NULL);
     pthread_mutex_lock(spec_moni_ctx->thread->lock);
-    
-    // Free hosts
-    free(tcp_hosts);
-    free(tcp_ports);
-    free(tcp_bandwidths);
-    
+
     // Free output queues
     free(samp_wind_arg->qsout);
     free(fft_arg->qsout);
     free(avg_arg->qsout);
-    free(cmpr_arg->qsout);
-    free(tcp_trns_arg->qsout);
+    free(dump_arg->qsout);
     
     // Free signal processing arguments
     free(samp_wind_arg);
     free(fft_arg);
     free(avg_arg);
-    free(cmpr_arg);
-    free(tcp_trns_arg);
+    free(dump_arg);
     
     // Free signal processing contexts
     THR_release(samp_wind_ctx->thread);
@@ -1605,18 +1430,15 @@ EXIT_SPECTRUM_MONITORING:
     
     THR_release(avg_ctx->thread);
     free(avg_ctx);
-    
-    THR_release(cmpr_ctx->thread);
-    free(cmpr_ctx);
-    
-    THR_release(tcp_trns_ctx->thread);
-    free(tcp_trns_ctx);
-    
+
+    THR_release(dump_ctx->thread);
+    free(dump_ctx);
+
+
     // Free signal processing queues
     QUE_release(q_fft);
     QUE_release(q_avg);
-    QUE_release(q_cmpr);
-    QUE_release(q_tcp_trns);
+    QUE_release(q_dump);
     
     SimilarityHistEntry *similarity_centry, *similarity_tentry;
     HASH_ITER(hh, similarity_hist_htable, similarity_centry, similarity_tentry) {
@@ -1632,7 +1454,6 @@ EXIT_SPECTRUM_MONITORING:
     free(log2_fft_sizes);
     free(avg_factors);
     free(soverlaps);
-    free(cmpr_levels);
     free(center_freqs);
     free(full_center_freqs);
     free(freq_overlaps);
@@ -1691,7 +1512,6 @@ static void* sampling_windowing(void *args) {
   unsigned int prev_fft_size = 0, fft_size, *log2_fft_sizes = NULL;
   unsigned int prev_avg_factor = 0, avg_factor, *avg_factors = NULL;
   unsigned int prev_soverlap = 0, soverlap, *soverlaps = NULL;
-  unsigned int cmpr_level, *cmpr_levels = NULL;
   unsigned int center_freq, *center_freqs = NULL, prev_center_freq = 0;
   int hopping_strategy_id;
   int window_fun_id;
@@ -1765,7 +1585,6 @@ static void* sampling_windowing(void *args) {
       log2_fft_sizes = (unsigned int *) realloc(log2_fft_sizes, length*sizeof(unsigned int));
       avg_factors = (unsigned int *) realloc(avg_factors, length*sizeof(unsigned int));
       soverlaps = (unsigned int *) realloc(soverlaps, length*sizeof(unsigned int));
-      cmpr_levels = (unsigned int *) realloc(cmpr_levels, length*sizeof(unsigned int));
       center_freqs = (unsigned int *) realloc(center_freqs, length*sizeof(unsigned int));
       freq_overlaps = (float *) realloc(freq_overlaps, length*sizeof(float));
       window_funs = (window_fun_ptr_t *) realloc(window_funs, length*sizeof(window_fun_ptr_t));
@@ -1776,7 +1595,6 @@ static void* sampling_windowing(void *args) {
       log2_fft_sizes[i] = samp_wind_ctx->log2_fft_sizes[i];
       avg_factors[i] = samp_wind_ctx->avg_factors[i];
       soverlaps[i] = samp_wind_ctx->soverlaps[i];
-      cmpr_levels[i] = samp_wind_ctx->cmpr_levels[i];
       center_freqs[i] = samp_wind_ctx->center_freqs[i];
       freq_overlaps[i] = samp_wind_ctx->freq_overlaps[i];
       window_funs[i] = samp_wind_ctx->window_funs[i];
@@ -1802,7 +1620,6 @@ static void* sampling_windowing(void *args) {
       fft_size = 1<<log2_fft_sizes[i];
       avg_factor = avg_factors[i];
       soverlap = soverlaps[i];
-      cmpr_level = cmpr_levels[i];
       center_freq = center_freqs[i];
       freq_overlap = freq_overlaps[i];
       window_fun = window_funs[i];
@@ -1863,7 +1680,6 @@ static void* sampling_windowing(void *args) {
 	iout->log2_fft_size = log2_fft_sizes[i];
 	iout->avg_index = avg_factor-j;
 	iout->avg_factor = avg_factor;
-	iout->cmpr_level = cmpr_level;
 	iout->freq_overlap = freq_overlap;
 	iout->soverlap = soverlap;
 	
@@ -1978,7 +1794,6 @@ static void* sampling_windowing(void *args) {
   free(log2_fft_sizes);
   free(avg_factors);
   free(soverlaps);
-  free(cmpr_levels);
   free(center_freqs);
   free(freq_overlaps);
   free(window_funs);
@@ -2447,43 +2262,31 @@ EXIT:
   
 }
 
-static void* compression(void *args) {
-  int r, i, l;
+static void* dumping(void *args) {
 
-  unsigned int cmpr_level;
+#if defined(VERBOSE) || defined(VERBOSE_DUMP)
+    fprintf(stderr, "[DUMP] Started.\n");
+#endif
+
+  int i, t;
+
+  uint32_t freq;
+  uint32_t center_freq;
   uint32_t fft_size, prev_reduced_fft_size = 0, reduced_fft_size;
-  float freq_res, s, *samples;
-  size_t src_len = 0, tgt_len;
-  uint32_t *src_buf = NULL, *tgt_buf;
-  
-  CompressionARG *cmpr_arg;
-  CompressionCTX *cmpr_ctx;
-  
-  size_t k, qsout_cnt;
-  Queue *qin, **qsout;
-  Item  *iin, *iout, *nout;
-  
-#if defined(MEASURE_CMPR)
-  struct timespec tstart = {0,0}, tend = {0,0};
-  FILE *f_stat_cmpr_time = fopen("dat/stats/f_stat_cmpr_time.dat", "w");
-  FILE *f_stat_cmpr_rat = fopen("dat/stats/f_stat_cmpr_rat.dat", "w");
-#endif
-  
+
+  float    freq_res;
+  float    *samples;
+
+  DumpingARG   *dump_arg;
+
+  Item  *iin;
+  Queue *qin;
+
   // Parse arguments
-  cmpr_arg = (CompressionARG *) args;
-  cmpr_ctx = (CompressionCTX *) cmpr_arg->cmpr_ctx;
-  qin = (Queue *) cmpr_arg->qin;
-  qsout = (Queue **) cmpr_arg->qsout;
-  qsout_cnt = cmpr_arg->qsout_cnt;
-  
-#if defined(VERBOSE) || defined(VERBOSE_CMPR) || defined(TID)
-#if defined(RPI_GPU)
-  fprintf(stderr, "[CMPR] Started.\tTID: %li\n", (long int) syscall(224));
-#else
-  fprintf(stderr, "[CMPR] Started.\n");
-#endif
-#endif
-  
+  dump_arg = (DumpingARG *) args;
+  qin = (Queue *) dump_arg->qin;
+
+  // Dump full plain-text data to stdout
   while(1) {
     // Wait for input queue not being empty
     pthread_mutex_lock(qin->mut);
@@ -2496,321 +2299,52 @@ static void* compression(void *args) {
       // Wait for more input coming to this queue
       pthread_cond_wait(qin->notEmpty, qin->mut);
     }
-    
+
     // Read item from input queue
     iin = (Item *) QUE_remove(qin);
+#if defined(VERBOSE) || defined(VERBOSE_DUMP)
+    fprintf(stderr, "[DUMP] Read from Queue.\n");
+#endif
     pthread_mutex_unlock(qin->mut);
     pthread_cond_signal(qin->notFull);
-    
-#if defined(VERBOSE) || defined(VERBOSE_CMPR)
-    fprintf(stderr, "[CMPR] Pull item.\n");
-#endif
+
+    center_freq = iin->Fc;
+    //reduced_fft_size = iin->reduced_fft_size;
+    freq_res = iin->freq_res;
+    samples = iin->samples;
 
     // Get item's characteristics
     fft_size = 1 << iin->log2_fft_size;
     reduced_fft_size = (1-iin->freq_overlap)*(fft_size+1);
     freq_res = ((float) iin->samp_rate) / fft_size;
-    cmpr_level = iin->cmpr_level;
-    samples = iin->samples;
-    
     // Check for changing FFT sizes
     if(reduced_fft_size != prev_reduced_fft_size) {
-      src_len = (4 + reduced_fft_size) * sizeof(uint32_t);
-      src_buf = (uint32_t *) realloc(src_buf, src_len);
       prev_reduced_fft_size = reduced_fft_size;
     }
-    
-    // Marshalling data
-    src_buf[0] = htonl(iin->Fc);		// Center frequency in Hz
-    src_buf[1] = htonl(iin->Ts_sec);		// Seconds since UNIX epoch
-    src_buf[2] = htonl(iin->Ts_usec);		// Time stamp microseconds
-    src_buf[3] = htonl(pack754_32(freq_res));	// Frequency resolution in Hz
-    // Quantization and FFT reduction
-    l = (fft_size - reduced_fft_size) / 2;
+
+    // Write item to file
+#if defined(VERBOSE) || defined(VERBOSE_DUMP)
+    fprintf(stderr, "[DUMP] Write to stdout: %zd reduced_ffts .\n", reduced_fft_size);
+#endif
+    t = reduced_fft_size / 2;
+
     for(i=0; i<reduced_fft_size; ++i) {
-      s = roundf(samples[l+i]*10.0f) / 10.0f;
-      src_buf[4+i] = htonl(pack754_32(s));
+      freq = center_freq - (t-i)*freq_res;
+      fprintf(stdout, "%u,%u,%u,%.1f\n", iin->Ts_sec, iin->Ts_usec, freq, samples[i]);
     }
-    
-    // Compress data
-    tgt_len = compressBound(src_len);
-    tgt_buf = (uint32_t *) malloc(tgt_len);
-#if defined(MEASURE_CMPR)
-    TICK(tstart);
-#endif
-    r = compress2((Bytef *) tgt_buf, (uLongf *) &tgt_len,
-		  (Bytef *) src_buf, (uLong) src_len, cmpr_level);
-#if defined(MEASURE_CMPR)
-    TACK(tstart, tend, f_stat_cmpr_time);
-#endif
-    
-    // Error handling
-    if(r != Z_OK) {
-      // TODO: How should we handle iout in case of an error?
-      switch(r) {
-	case Z_MEM_ERROR:
-	  fprintf(stderr, "[CMPR] Error: Not enough memory to compress.\n");
-	  break;
-	case Z_BUF_ERROR:
-	  fprintf(stderr, "[CMPR] Error: Target buffer too small.\n");
-	  break;
-	case Z_STREAM_ERROR:	// Invalid compression level
-	  fprintf(stderr, "[CMPR] Error: Invalid compression level.\n");
-	  break;
-      }
-    }
-    
-    iout = iin;
-    iout->data_size = tgt_len;
-    iout->data = tgt_buf;
-    
-    // Strategy dependent callback to the monitoring logic
-    if(cmpr_ctx != NULL && cmpr_ctx->callback != NULL)
-      cmpr_ctx->callback(iout);
-    
-    // Single output queue
-    if(qsout_cnt == 1) {
-      // Wait for output queue not being full
-      pthread_mutex_lock(qsout[0]->mut);
-      while(qsout[0]->full) {
-#if defined(VERBOSE) || defined(VERBOSE_CMPR)
-	fprintf(stderr, "[CMPR] Output queue 0 full.\n");
-#endif
-	pthread_cond_wait(qsout[0]->notFull, qsout[0]->mut);
-      }
-      QUE_insert(qsout[0], iout);
-#if defined(VERBOSE) || defined(VERBOSE_CMPR)
-      fprintf(stderr, "[CMPR] Push item %u to output queue 0.\n", iout->avg_index);
-#endif
-      pthread_mutex_unlock(qsout[0]->mut);
-      pthread_cond_signal(qsout[0]->notEmpty);
-    }
-    // Multiple output queues
-    else if(qsout_cnt > 1) {
-      // Put item to output queues
-      for(k=0; k<qsout_cnt; ++k) {
-	// Wait for output queue not being full
-	pthread_mutex_lock(qsout[k]->mut);
-	while(qsout[k]->full) {
-#if defined(VERBOSE) || defined(VERBOSE_CMPR)
-	  fprintf(stderr, "[CMPR] Output queue %zd full.\n", k);
-#endif
-	  pthread_cond_wait(qsout[k]->notFull, qsout[k]->mut);
-	}
-	nout = ITE_copy(iout);
-	// Write item to output queue
-	QUE_insert(qsout[k], nout);
-#if defined(VERBOSE) || defined(VERBOSE_CMPR)
-	fprintf(stderr, "[CMPR] Push item %u to output queue %zd.\n", nout->avg_index, k);
-#endif
-	pthread_mutex_unlock(qsout[k]->mut);
-	pthread_cond_signal(qsout[k]->notEmpty);
-      }
-      // Release item
-      ITE_free(iout);
-    }
-    
-#if defined(MEASURE_CMPR)
-    // Compression ratio
-    float cmpr_rat = (1.0f - ((float) tgt_len / src_len))*100.f;
-    fprintf(f_stat_cmpr_rat, "%f\n", cmpr_rat);
-#endif
-  }
-  
-EXIT:
-
-  // Signal that we are done and no further items will appear in the queues
-  for(k=0; k<qsout_cnt; ++k) {
-    pthread_mutex_lock(qsout[k]->mut);
-    qsout[k]->exit = 1;
-    pthread_cond_signal(qsout[k]->notEmpty);
-    pthread_cond_signal(qsout[k]->notFull);
-    pthread_mutex_unlock(qsout[k]->mut);
-  }
-  
-#if defined(MEASURE_CMPR)
-  fclose(f_stat_cmpr_time);
-  fclose(f_stat_cmpr_rat);
-#endif
-  
-  free(src_buf);
-  
-#if defined(VERBOSE) || defined(VERBOSE_CMPR)
-  fprintf(stderr, "[CMPR] Terminated.\n");
-#endif
-  
-  pthread_exit(NULL);
-  
-}
-
-static void* tcp_transmission(void *args) {
-  int                     i;
-  size_t                  tcp_hosts_cnt;
-  char                    **tcp_hosts = NULL;
-  uint32_t                *tcp_ports = NULL;
-  int                     *tcp_bandwidths = NULL;
-  TCP_Connection          **tcp_con = NULL;
-
-  uint32_t                *buf = NULL;
-  uint32_t                log2_fft_size, fft_size, reduced_fft_size;
-  uint32_t                prev_data_size = 0, data_size, payload_size, packet_size = 0;
-  float                   freq_overlap;
-  
-  int                     bytes_sent = 0;
-  UTI_BandwidthController **bcs = NULL;
-  
-  Queue                   *qin;
-  Item                    *iin;
-  
-  TcpTransmissionARG      *tcp_trns_arg;
-  TcpTransmissionCTX      *tcp_trns_ctx;
-  
-  // Parse arguments
-  tcp_trns_arg = (TcpTransmissionARG *) args;
-  tcp_trns_ctx = (TcpTransmissionCTX *) tcp_trns_arg->tcp_trns_ctx;
-  qin = (Queue *) tcp_trns_arg->qin;
-  tcp_hosts_cnt = tcp_trns_ctx->tcp_hosts_cnt;
-  tcp_hosts = tcp_trns_ctx->tcp_hosts;
-  tcp_ports = tcp_trns_ctx->tcp_ports;
-  tcp_bandwidths = tcp_trns_ctx->tcp_bandwidths;
-
-#if defined(VERBOSE) || defined(VERBOSE_TCP_TRNS) || defined(TID)
-#if defined(RPI_GPU)
-  fprintf(stderr, "[TTRS] Started.\tTID: %li\n", (long int) syscall(224));
-#else
-  fprintf(stderr, "[TTRS] Started.\n");
-#endif
-#endif
-  
-  // Initialize TCP connections
-  tcp_con = (TCP_Connection **) malloc(tcp_hosts_cnt*sizeof(TCP_Connection *));
-  for(i=0; i<tcp_hosts_cnt; ++i) {
-#if defined(VERBOSE) || defined(VERBOSE_TCP_TRNS)
-    tcp_init_p(&tcp_con[i], tcp_hosts[i], tcp_ports[i]);
-    while(tcp_connect_p(tcp_con[i]) < 0) {sleep(1);}
-#else
-    tcp_init(&tcp_con[i], tcp_hosts[i], tcp_ports[i]);
-    while(tcp_connect(tcp_con[i]) < 0) {sleep(1);}
-#endif
-  }
-  
-  // Initialize bandwidth controllers
-  bcs = (UTI_BandwidthController **) malloc(tcp_hosts_cnt * sizeof(UTI_BandwidthController *));
-  for(i=0; i<tcp_hosts_cnt; ++i) {
-    bcs[i] = UTI_initialize_bandwidth_controller(tcp_bandwidths[i]);
-  }
-
-  while(1) {
-    // Wait for input queue not being empty
-    pthread_mutex_lock(qin->mut);
-    while(qin->empty) {
-      // No more input is coming to this queue
-      if(qin->exit) {
-	pthread_mutex_unlock(qin->mut);
-	goto EXIT;
-      }
-      // Wait for more input coming to this queue
-      pthread_cond_wait(qin->notEmpty, qin->mut);
-    }
-   
-    // Read item from input queue
-    iin = (Item *) QUE_remove(qin);
-    pthread_mutex_unlock(qin->mut);
-    pthread_cond_signal(qin->notFull);
-    
-#if defined(VERBOSE) || defined(VERBOSE_TCP_TRNS)
-    fprintf(stderr, "[TTRS] Pull item.\n");
-#endif
-    
-    // Get item's characteristics
-    freq_overlap = iin->freq_overlap;
-    log2_fft_size = iin->log2_fft_size;
-    fft_size = 1<<log2_fft_size;
-    reduced_fft_size = (1-freq_overlap)*(fft_size+1);
-    data_size = iin->data_size;
-    
-    // Check for changing data sizes
-    if(data_size != prev_data_size) {
-      // The payload consists of the compressed data plus some padding, guaranteeing the packet size
-      // to be a multiple of 4
-      payload_size = (data_size + 3) & ~0x03;
-      packet_size = 2*sizeof(uint32_t) + payload_size;
-      buf = (uint32_t *) realloc(buf, packet_size);
-      memset(buf, 0, packet_size);
-      prev_data_size = data_size;
-    }
-    
-    // Packing
-    buf[0] = htonl(data_size);			// Data size
-    buf[1] = htonl(reduced_fft_size);		// Reduced FFT Size
-    memcpy(buf+2, iin->data, data_size);	// Compressed data
-    
-    // Send item over TCP
-    for(i=0; i<tcp_hosts_cnt; ++i) {
-      
-      // Enforce bandwidth throttling
-      UTI_enforce_bandwidth_throttling(bcs[i], bytes_sent);
-      
-#if defined(VERBOSE) || defined(VERBOSE_TCP_TRNS)
-      tcp_write_p(tcp_con[i], buf, packet_size);
-#else
-      tcp_write(tcp_con[i], buf, packet_size);
-#endif
-    }
-    
-    // Bytes sent
-    bytes_sent = packet_size;
-    
-    // Strategy dependent callback to the monitoring logic
-    if(tcp_trns_ctx != NULL && tcp_trns_ctx->callback != NULL)
-      tcp_trns_ctx->callback(iin);
+    fflush(stdout);
 
     // Release item
-    ITE_free(iin);
-    
-#if defined(VERBOSE) || defined(VERBOSE_TCP_TRNS)
-    fprintf(stderr, "[TTRS] Push item.\n");
-#endif
-    
-  }
-  
-  EXIT:
+    free(samples);
+    free(iin);
 
-  // Release bandwidth controllers
-  for(i=0; i<tcp_hosts_cnt; ++i) {
-    UTI_release_bandwidth_controller(bcs[i]);
   }
-  free(bcs);
-  
-  // Signal that we are done and no further items will appear in the queue
-  if(buf == NULL) buf = (uint32_t *) malloc(sizeof(uint32_t));
-  buf[0] = htonl(0);
-  for(i=0; i<tcp_hosts_cnt; ++i) {
-#if defined(VERBOSE) || defined(VERBOSE_TCP_TRNS)
-    tcp_write_p(tcp_con[i], buf, sizeof(uint32_t));
-#else
-    tcp_write(tcp_con[i], buf, sizeof(uint32_t));
+
+EXIT:
+
+#if defined(VERBOSE) || defined(VERBOSE_DUMP)
+  fprintf(stderr, "[DUMP] Terminated.\n");
 #endif
-  }
-  
-  // Release TCP connections
-  for(i=0; i<tcp_hosts_cnt; ++i) {
-#if defined(VERBOSE) || defined(VERBOSE_TCP_TRNS)
-    tcp_disconnect_p(tcp_con[i]);
-    tcp_release_p(tcp_con[i]);
-#else
-    tcp_disconnect(tcp_con[i]);
-    tcp_release(tcp_con[i]);
-#endif
-  }
-  free(tcp_con);
-  
-  free(buf);
-  
-#if defined(VERBOSE) || defined(VERBOSE_TCP_TRNS)
-  fprintf(stderr, "[TTRS] Terminated.\n");
-#endif
-  
+
   pthread_exit(NULL);
-  
 }
