@@ -95,6 +95,7 @@ typedef struct {
 	unsigned int soverlap;
 	unsigned int monitor_time;
 	unsigned int min_time_res;
+	unsigned int number_of_sample_runs;
 	unsigned int fft_batchlen;
 	int          dev_index;
 	int          clk_off;
@@ -125,6 +126,7 @@ typedef struct {
 	unsigned int soverlap;
 	unsigned int monitor_time;
 	unsigned int min_time_res;
+	unsigned int number_of_sample_runs;
 	unsigned int fft_batchlen;
 	int          hopping_strategy_id;
 	int          window_fun_id;
@@ -314,7 +316,7 @@ int main(int argc, char *argv[]) {
 	// Parse arguments and options
 	void parse_args(int argc, char *argv[]) {
 		int opt;
-		const char *options = "hd:c:k:g:y:s:f:b:a:o:q:t:r:w:";
+		const char *options = "hd:c:k:g:y:s:f:b:a:o:q:t:r:w:x:";
 
 		// Option arguments
 		while((opt = getopt(argc, argv, options)) != -1) {
@@ -366,6 +368,9 @@ int main(int argc, char *argv[]) {
 			case 'w':
 				manager_ctx->window_fun_str = optarg;
 				break;
+			case 'x':
+				manager_ctx->number_of_sample_runs = atol(optarg);
+				break;
 			default:
 				goto usage;
 			}
@@ -387,6 +392,7 @@ int main(int argc, char *argv[]) {
 					"  [-a <avg_factor>] [-o <soverlap>] [-q <freq_overlap>]\n"
 					"  [-t <monitor_time>] [-r <min_time_res>]\n"
 					"  [-w <window>]\n"
+					"  [-x <sample runs>]\n"
 					"\n"
 					"Arguments:\n"
 					"  min_freq               Lower frequency bound in Hz\n"
@@ -428,6 +434,7 @@ int main(int argc, char *argv[]) {
 					"                           rectangular\n"
 					"                           hanning\n"
 					"                           blackman_harris_4\n"
+					"  -x <sample runs>       Stops after N times sampling the band. 0 means off (default)\n"
 					"",
 					argv[0],
 					manager_ctx->dev_index,
@@ -463,6 +470,7 @@ int main(int argc, char *argv[]) {
 	manager_ctx->soverlap = DEFAULT_SOVERLAP;
 	manager_ctx->monitor_time = DEFAULT_MONITOR_TIME;
 	manager_ctx->min_time_res = DEFAULT_MIN_TIME_RES;
+	manager_ctx->number_of_sample_runs = 0;
 	manager_ctx->fft_batchlen = DEFAULT_FFT_BATCHLEN;
 	manager_ctx->gain = DEFAULT_GAIN;
 	manager_ctx->freq_overlap = DEFAULT_FREQ_OVERLAP;
@@ -489,6 +497,7 @@ int main(int argc, char *argv[]) {
 	spec_moni_ctx->soverlap = manager_ctx->soverlap;
 	spec_moni_ctx->monitor_time = manager_ctx->monitor_time;
 	spec_moni_ctx->min_time_res = manager_ctx->min_time_res;
+	spec_moni_ctx->number_of_sample_runs = manager_ctx->number_of_sample_runs;
 	spec_moni_ctx->fft_batchlen = manager_ctx->fft_batchlen;
 	spec_moni_ctx->gain = manager_ctx->gain;
 	spec_moni_ctx->freq_overlap = manager_ctx->freq_overlap;
@@ -782,6 +791,7 @@ static void* spectrum_monitoring(void *args) {
 		unsigned int samp_rate;
 		unsigned int log2_fft_size, avg_factor, soverlap;
 		unsigned int monitor_time, min_time_res, fft_batchlen;
+		unsigned int number_of_sample_runs, measurements_left;
 
 		int clk_off;
 		float gain, freq_overlap;
@@ -1233,6 +1243,8 @@ static void* spectrum_monitoring(void *args) {
 		 soverlap = spec_moni_ctx->soverlap;
 		 monitor_time = spec_moni_ctx->monitor_time;
 		 min_time_res = spec_moni_ctx->min_time_res;
+		 number_of_sample_runs = spec_moni_ctx->number_of_sample_runs;
+		 measurements_left = number_of_sample_runs;
 		 fft_batchlen = spec_moni_ctx->fft_batchlen;
 		 gain = spec_moni_ctx->gain;
 		 freq_overlap = spec_moni_ctx->freq_overlap;
@@ -1331,6 +1343,11 @@ static void* spectrum_monitoring(void *args) {
 
 					 // Reset flag
 					 spec_moni_ctx->thread->flags ^= FLAG_SAMP_WIND;
+
+					 // Terminate after a certain number of runs
+					 if((number_of_sample_runs != 0) && (measurements_left == 0))
+						 goto EXIT_SPECTRUM_MONITORING;
+					 measurements_left--;
 
 					 // Terminate after monitor_time seconds when monitor_time > 0
 					 time(&current_t);
